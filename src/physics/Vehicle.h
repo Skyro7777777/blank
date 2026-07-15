@@ -23,6 +23,12 @@ struct VehicleConfig {
     // Chassis
     glm::vec3 chassisHalfExtents{1.0f, 0.5f, 2.2f};
     float chassisMass = 1200.0f;
+    // Extra Y offset of the chassis box center ABOVE the wheel connection plane.
+    // The connection points sit at chassisHalfExtents.y below the chassis center,
+    // but the visual body's lowest point is lower than that, so the collision box
+    // must be raised a bit so it does not intersect the ground at rest and launch
+    // the car skyward.
+    float chassisYShift = 0.0f;
 
     // Suspension
     float suspensionStiffness = 30.0f;
@@ -30,11 +36,17 @@ struct VehicleConfig {
     float suspensionCompression = 4.0f;
     float maxSuspensionTravel = 0.3f;
     float frictionSlip = 1000.0f;
+    float rollInfluence = 0.0f;  // Low = stable, resists tipping / rocketing
 
     // Engine
     float maxEngineForce = 2500.0f;
     float maxBrakingForce = 100.0f;
     float maxSteerAngle = 0.5f;  // ~30 degrees
+    float maxSpeedMs = 55.0f;    // Speed limiter (~200 km/h) to avoid runaway
+
+    // Visual scaling
+    float modelScale = 1.0f;     // Scales the rendered car (and measured wheel radius)
+    float wheelScale = 1.25f;    // Diameter multiplier for the physics wheels
 
     // Wheels (relative to chassis center)
     std::vector<WheelInfo> wheels;
@@ -70,6 +82,10 @@ public:
     Model& model() { return m_model; }
     const Model& model() const { return m_model; }
     float modelYOffset() const { return m_modelYOffset; }
+    float modelScale() const { return m_modelScale; }
+    // Diameter multiplier applied to wheel meshes only (so the visual wheels
+    // match the physics wheels, whose radius = modelR * modelScale * wheelScale).
+    float wheelScale() const { return m_config.wheelScale; }
 
     // Wheel mesh identification
     bool isWheelMesh(int meshIndex) const { return m_wheelMeshGroup.size() > 0 && findWheelGroup(meshIndex) >= 0; }
@@ -92,6 +108,7 @@ private:
 
     // Physics
     btCollisionShape* m_chassisShape = nullptr;
+    btCompoundShape* m_compoundShape = nullptr;  // Wraps m_chassisShape for Y offset
     btRigidBody* m_chassisBody = nullptr;
     btVehicleRaycaster* m_raycaster = nullptr;
     btRaycastVehicle* m_vehicle = nullptr;
@@ -110,6 +127,7 @@ private:
     bool m_active = false;
     VehicleConfig m_config;
     float m_modelYOffset = 0.0f;  // Y offset to align model origin with chassis center
+    float m_modelScale = 1.0f;    // Render scale applied to body + wheel meshes
 
     // Wheel indices in btRaycastVehicle
     int m_wheelCount = 0;
@@ -118,6 +136,9 @@ private:
     std::vector<std::vector<int>> m_wheelMeshGroup;
     // Local-space center of each wheel group's vertices (in model space)
     std::vector<glm::vec3> m_wheelMeshCenters;
+    // Wheel radius measured from the model's wheel meshes (so physics wheels
+    // match the visual wheels and the body sits at the correct ride height).
+    float m_modelWheelRadius = 0.0f;
     void identifyWheelMeshes();
     void computeWheelMeshCenters();
 };

@@ -136,7 +136,10 @@ void Engine::processInput() {
         }
 
         // Camera-relative movement
-        float speed = m_input.isKeyPressed(GLFW_KEY_LEFT_SHIFT) ? 2.5f : 1.0f;
+        // Shift = sprint (1.8x). Pass a NORMALIZED direction; the player
+        // controller multiplies by m_moveSpeed (m/s). Do NOT pre-multiply by dt
+        // -- that was the old bug making walking feel extremely slow.
+        float sprint = m_input.isKeyPressed(GLFW_KEY_LEFT_SHIFT) ? 1.8f : 1.0f;
         glm::vec3 camFront = m_camera.front();
         glm::vec3 camRight = m_camera.right();
         // Project to XZ plane (no vertical movement from WASD)
@@ -152,7 +155,12 @@ void Engine::processInput() {
         if (m_input.isKeyPressed(GLFW_KEY_S)) moveDir -= forward;
         if (m_input.isKeyPressed(GLFW_KEY_D)) moveDir += right;
         if (m_input.isKeyPressed(GLFW_KEY_A)) moveDir -= right;
-        m_player.setMoveInput(moveDir * speed * m_timer.deltaTime());
+        // Normalize so diagonal speed matches axial speed, then apply sprint.
+        float ml = glm::length(moveDir);
+        if (ml > 0.001f) {
+            moveDir /= ml;
+            m_player.setMoveInput(moveDir * sprint);
+        }
         if (m_input.isKeyJustPressed(GLFW_KEY_SPACE)) m_player.jump();
         if (m_input.isKeyPressed(GLFW_KEY_LEFT_CONTROL)) m_player.setCrouching(true);
         else m_player.setCrouching(false);
@@ -273,16 +281,27 @@ void Engine::renderShadowPass() {
 
     for (auto& v : m_vehicles) {
         if (!v->isActive()) continue;
-        // Body meshes with chassis transform
+        // Body meshes with chassis transform. Apply modelScale so the whole car
+        // (body + wheels) renders at the configured size. The Y offset aligns the
+        // model's axle to the physics wheel center, and the scale grows the model
+        // about its own origin -- order: translate(origin->chassis) * rotate *
+        // translate(Y offset) * scale.
         glm::mat4 chassisTF = v->chassisTransform();
         chassisTF = glm::translate(chassisTF, glm::vec3(0.0f, v->modelYOffset(), 0.0f));
+        chassisTF = glm::scale(chassisTF, glm::vec3(v->modelScale()));
         const auto& meshes = v->model().meshes();
         for (int mi = 0; mi < static_cast<int>(meshes.size()); ++mi) {
             int wg = v->findWheelGroup(mi);
             if (wg >= 0 && wg < v->wheelCount()) {
-                // Wheel mesh: shift mesh center to wheel origin, then apply wheel world transform
+                // Wheel mesh: recenter in local (unscaled) space, then scale by
+                // modelScale * wheelScale (so visual wheels match physics wheels),
+                // then apply the physics wheel world transform.
                 glm::mat4 wTF = v->wheelTransform(wg);
-                wTF = glm::translate(wTF, -v->wheelMeshCenter(wg));
+                float ws = v->modelScale() * v->wheelScale();
+                glm::mat4 local = glm::mat4(1.0f);
+                local = glm::translate(local, -v->wheelMeshCenter(wg));
+                local = glm::scale(local, glm::vec3(ws));
+                wTF = wTF * local;
                 m_shadowShader.setMat4("model", wTF);
             } else {
                 m_shadowShader.setMat4("model", chassisTF);
@@ -361,16 +380,24 @@ void Engine::renderScene() {
     // Vehicles (render with model materials)
     for (auto& v : m_vehicles) {
         if (!v->isActive()) continue;
+        // Apply modelScale to the whole car (body + wheels) for a bigger FPV car.
         glm::mat4 chassisTF = v->chassisTransform();
         chassisTF = glm::translate(chassisTF, glm::vec3(0.0f, v->modelYOffset(), 0.0f));
+        chassisTF = glm::scale(chassisTF, glm::vec3(v->modelScale()));
         const auto& meshes = v->model().meshes();
         for (int mi = 0; mi < static_cast<int>(meshes.size()); ++mi) {
             // Set model matrix: chassis for body, physics position for wheels
             int wg = v->findWheelGroup(mi);
             if (wg >= 0 && wg < v->wheelCount()) {
-                // Wheel mesh: shift mesh center to wheel origin, then apply wheel world transform
+                // Wheel mesh: recenter in local (unscaled) space, then scale by
+                // modelScale * wheelScale (so visual wheels match physics wheels),
+                // then apply the physics wheel world transform.
                 glm::mat4 wTF = v->wheelTransform(wg);
-                wTF = glm::translate(wTF, -v->wheelMeshCenter(wg));
+                float ws = v->modelScale() * v->wheelScale();
+                glm::mat4 local = glm::mat4(1.0f);
+                local = glm::translate(local, -v->wheelMeshCenter(wg));
+                local = glm::scale(local, glm::vec3(ws));
+                wTF = wTF * local;
                 m_pbrShader.setMat4("model", wTF);
             } else {
                 m_pbrShader.setMat4("model", chassisTF);

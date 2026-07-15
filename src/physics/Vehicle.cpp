@@ -3,9 +3,11 @@
 #include "core/Logger.h"
 #include <BulletDynamics/Vehicle/btRaycastVehicle.h>
 #include <BulletCollision/CollisionDispatch/btGhostObject.h>
+#include <BulletCollision/CollisionShapes/btCompoundShape.h>
 #include <glm/gtc/quaternion.hpp>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 
 namespace ps {
 
@@ -18,6 +20,7 @@ Vehicle::~Vehicle() {
 bool Vehicle::init(PhysicsWorld& world, const std::string& modelPath,
                     const glm::vec3& spawnPos, const VehicleConfig& config) {
     m_config = config;
+    m_modelScale = config.modelScale;
 
     // Load car model
     if (!modelPath.empty()) {
@@ -26,38 +29,61 @@ bool Vehicle::init(PhysicsWorld& world, const std::string& modelPath,
         } else {
             LOG_INFO("Vehicle model loaded: %s (%zu meshes)",
                      modelPath.c_str(), m_model.meshes().size());
-            // Model origin is typically at the bottom (ground level).
-            // Chassis center is at the middle of the box, so offset = -halfHeight.
-            m_modelYOffset = -config.chassisHalfExtents.y;
-
-            // Identify wheel meshes by name and compute their local centers
+            // Identify wheel meshes by name and compute their local centers +
+            // the model's actual wheel radius. NOTE: m_modelYOffset is finalized
+            // AFTER setupWheels(), because it must account for the suspension rest
+            // length -- the wheels hang below the chassis connection point by the
+            // rest length, so the body has to be shifted down by that amount to
+            // line the model's wheel-arches up with the physics wheel centers.
             identifyWheelMeshes();
             computeWheelMeshCenters();
         }
     }
 
-    // Create chassis box shape
-    m_chassisShape = shapes::createBox(config.chassisHalfExtents);
+    // Apply model scale to the measured wheel radius so the physics wheels grow
+    // with the rendered car, then apply the user wheelScale (diameter multiplier).
+    float baseWheelRadius = (m_modelWheelRadius > 0.0f ? m_modelWheelRadius : 0.35f)
+                            * m_modelScale;
+    float physWheelRadius = baseWheelRadius * config.wheelScale;
+    LOG_INFO("Wheel radius: model=%.3f scaled=%.3f physics(with wheelScale %.2f)=%.3f",
+             m_modelWheelRadius, baseWheelRadius, config.wheelScale, physWheelRadius);
 
-    // Create chassis rigid body
+    // Build the collision shape. The chassis box must NOT touch the ground at
+    // rest -- if it does, Bullet generates a huge upward impulse that launches
+    // the car skyward (the classic "rocket car" bug). We wrap the box in a
+    // compound shape and raise it by chassisYShift so its bottom sits above the
+    // wheel contact plane, leaving the suspension to support the car.
+    m_chassisShape = shapes::createBox(config.chassisHalfExtents);
+    m_compoundShape = new btCompoundShape();
+    btTransform boxLocalTrans;
+    boxLocalTrans.setIdentity();
+    boxLocalTrans.setOrigin(btVector3(0, config.chassisYShift, 0));
+    m_compoundShape->addChildShape(boxLocalTrans, m_chassisShape);
+
+    // Spawn exactly at rest height so the car starts settled on its suspension:
+    //   chassisCenterY = groundY + wheelRadius + suspensionRestLength + chassisHalfHeight
+    float wheelRestLength = 0.5f;  // matches the default wheel layout in setupWheels()
+    float spawnY = spawnPos.y + config.chassisHalfExtents.y + physWheelRadius + wheelRestLength;
+
     btTransform transform;
     transform.setIdentity();
-    // Spawn low enough that wheels are near ground (chassis bottom at spawnY - halfHeight)
-    float spawnY = spawnPos.y + config.chassisHalfExtents.y + 0.55f;
     transform.setOrigin(btVector3(spawnPos.x, spawnY, spawnPos.z));
 
     auto* motionState = new btDefaultMotionState(transform);
     btVector3 localInertia(0, 0, 0);
-    m_chassisShape->calculateLocalInertia(config.chassisMass, localInertia);
+    m_compoundShape->calculateLocalInertia(config.chassisMass, localInertia);
 
     btRigidBody::btRigidBodyConstructionInfo ci(
-        config.chassisMass, motionState, m_chassisShape, localInertia);
+        config.chassisMass, motionState, m_compoundShape, localInertia);
     ci.m_friction = 0.3f;
-    ci.m_linearDamping = 0.2f;
-    ci.m_angularDamping = 0.99f;  // Very high to prevent flipping
+    ci.m_linearDamping = 0.15f;
+    ci.m_angularDamping = 0.95f;  // High to resist tipping / spinning out
+    ci.m_restitution = 0.0f;      // No bounce on collisions
 
     m_chassisBody = new btRigidBody(ci);
     m_chassisBody->setActivationState(DISABLE_DEACTIVATION);
+    // Keep the car from rolling over its up axis; allow yaw only.
+    m_chassisBody->setAngularFactor(btVector3(0, 1, 0));
 
     world.addRigidBody(m_chassisBody, GROUP_VEHICLE, Mask::VEHICLE);
 
@@ -71,13 +97,33 @@ bool Vehicle::init(PhysicsWorld& world, const std::string& modelPath,
     // Setup wheels
     setupWheels(world, config);
 
-    // IMPORTANT: Reset suspension to stabilize initial state
-    m_vehicle->resetSuspension();
+    // Finalize the model Y offset now that the wheels (and their rest length)
+    // exist. The body must be shifted down by the suspension rest length so that
+    // the model's wheel-arches (at the model's axle height, y=0) line up with the
+    // physics wheel centers, which sit one rest-length BELOW the connection points.
+    if (m_vehicle->getNumWheels() > 0) {
+        m_modelYOffset = -config.chassisHalfExtents.y
+                       - m_vehicle->getWheelInfo(0).getSuspensionRestLength();
+    } else {
+        m_modelYOffset = -config.chassisHalfExtents.y;
+    }
+    LOG_INFO("Vehicle modelYOffset = %.3f (halfHeight=%.3f, restLen=%.3f, wheelRadius=%.3f, scale=%.2f)",
+             m_modelYOffset, config.chassisHalfExtents.y,
+             m_vehicle->getNumWheels() > 0 ? m_vehicle->getWheelInfo(0).getSuspensionRestLength() : 0.0f,
+             physWheelRadius, m_modelScale);
 
-    // Pre-simulate to let the car settle on the ground before activating
-    for (int i = 0; i < 60; ++i) {
+    // Reset suspension and run a short pre-simulation so the car settles cleanly.
+    // IMPORTANT: only resetSuspension ONCE -- calling it every step fights the
+    // raycast and is itself a major cause of the car "bouncing / flying off".
+    m_vehicle->resetSuspension();
+    for (int i = 0; i < 20; ++i) {
         world.world()->stepSimulation(1.0f / 60.0f, 1, 1.0f / 60.0f);
-        m_vehicle->resetSuspension();
+        // Clamp any vertical velocity that the settling might produce so a bad
+        // first contact cannot accumulate into a launch.
+        btVector3 v = m_chassisBody->getLinearVelocity();
+        if (std::abs(v.y()) > 1.0f) v.setY(0.0f);
+        m_chassisBody->setLinearVelocity(v);
+        m_chassisBody->setAngularVelocity(btVector3(0, 0, 0));
     }
 
     // Pre-update to establish initial wheel contact
@@ -92,6 +138,10 @@ bool Vehicle::init(PhysicsWorld& world, const std::string& modelPath,
 }
 
 void Vehicle::setupWheels(PhysicsWorld& world, const VehicleConfig& config) {
+    // Physics wheel radius = measured model radius * modelScale * wheelScale
+    float baseR = (m_modelWheelRadius > 0.0f ? m_modelWheelRadius : 0.35f) * m_modelScale;
+    float r = baseR * config.wheelScale;
+
     if (config.wheels.empty()) {
         // Default 4-wheel layout if none specified
         float w = config.chassisHalfExtents.x * 0.85f;
@@ -99,12 +149,11 @@ void Vehicle::setupWheels(PhysicsWorld& world, const VehicleConfig& config) {
         float l = config.chassisHalfExtents.z * 0.7f;
 
         // Front-left, Front-right, Rear-left, Rear-right
-        config.wheels; // Can't modify const ref, use defaults below
         std::vector<WheelInfo> defaultWheels = {
-            {{-w, h,  l}, {0,-1,0}, {-1,0,0}, 0.5f, 0.35f, true},   // FL
-            {{ w, h,  l}, {0,-1,0}, {-1,0,0}, 0.5f, 0.35f, true},   // FR
-            {{-w, h, -l}, {0,-1,0}, {-1,0,0}, 0.5f, 0.35f, false},  // RL
-            {{ w, h, -l}, {0,-1,0}, {-1,0,0}, 0.5f, 0.35f, false},  // RR
+            {{-w, h,  l}, {0,-1,0}, {-1,0,0}, 0.5f, r, true},   // FL
+            {{ w, h,  l}, {0,-1,0}, {-1,0,0}, 0.5f, r, true},   // FR
+            {{-w, h, -l}, {0,-1,0}, {-1,0,0}, 0.5f, r, false},  // RL
+            {{ w, h, -l}, {0,-1,0}, {-1,0,0}, 0.5f, r, false},  // RR
         };
 
         for (const auto& w_info : defaultWheels) {
@@ -123,6 +172,7 @@ void Vehicle::setupWheels(PhysicsWorld& world, const VehicleConfig& config) {
             wheel.m_wheelsDampingCompression = config.suspensionCompression;
             wheel.m_frictionSlip = config.frictionSlip;
             wheel.m_maxSuspensionTravelCm = config.maxSuspensionTravel * 100.0f;
+            wheel.m_rollInfluence = config.rollInfluence;
             ++m_wheelCount;
         }
     } else {
@@ -142,6 +192,7 @@ void Vehicle::setupWheels(PhysicsWorld& world, const VehicleConfig& config) {
             wheel.m_wheelsDampingCompression = config.suspensionCompression;
             wheel.m_frictionSlip = config.frictionSlip;
             wheel.m_maxSuspensionTravelCm = config.maxSuspensionTravel * 100.0f;
+            wheel.m_rollInfluence = config.rollInfluence;
             ++m_wheelCount;
         }
     }
@@ -149,6 +200,29 @@ void Vehicle::setupWheels(PhysicsWorld& world, const VehicleConfig& config) {
 
 void Vehicle::update(float dt) {
     if (!m_vehicle || !m_active) return;
+
+    // ── Stability clamp: cap linear speed and zero out any runaway vertical /
+    // angular velocity that would otherwise make the car "bounce and fly to sky".
+    if (m_chassisBody) {
+        btVector3 v = m_chassisBody->getLinearVelocity();
+        float horizSpeed = std::sqrt(v.x()*v.x() + v.z()*v.z());
+        if (horizSpeed > m_config.maxSpeedMs) {
+            float scl = m_config.maxSpeedMs / horizSpeed;
+            v.setX(v.x() * scl);
+            v.setZ(v.z() * scl);
+        }
+        // Kill vertical spikes (launches) beyond a sane bound.
+        if (v.y() > 8.0f) v.setY(8.0f);
+        if (v.y() < -15.0f) v.setY(-15.0f);
+        m_chassisBody->setLinearVelocity(v);
+
+        // Clamp angular velocity to prevent tumbling.
+        btVector3 av = m_chassisBody->getAngularVelocity();
+        if (av.length2() > 9.0f) {  // 3 rad/s cap
+            av *= 3.0f / std::sqrt(av.length2());
+            m_chassisBody->setAngularVelocity(av);
+        }
+    }
 
     // Apply engine force to rear wheels (or all for AWD)
     float engineForce = m_throttle * m_config.maxEngineForce;
@@ -261,36 +335,54 @@ void Vehicle::destroy(PhysicsWorld& world) {
         delete m_chassisBody;
         m_chassisBody = nullptr;
     }
+    // m_chassisShape is owned by m_compoundShape as a child; delete compound first.
+    delete m_compoundShape; m_compoundShape = nullptr;
     delete m_chassisShape; m_chassisShape = nullptr;
 }
 
 VehicleConfig Vehicle::defaultConfig() {
     VehicleConfig c;
-    c.chassisHalfExtents = {0.9f, 0.4f, 2.0f};
+    // Sized to match the Lexus IS-F GLB model (body ~2.0 W, ~1.7 H, ~4.66 L).
+    // The collision box is intentionally a bit smaller than the visual body so
+    // wheel collision (raycast) handles most contact; the box prevents the car
+    // from driving through walls.
+    c.chassisHalfExtents = {0.95f, 0.45f, 2.15f};
+    c.chassisYShift = 0.15f;          // Raise box so it clears the ground at rest
     c.chassisMass = 1200.0f;
-    c.suspensionStiffness = 15.0f;    // Softer = less bouncing
-    c.suspensionDamping = 4.0f;       // Higher = absorbs oscillation
-    c.suspensionCompression = 4.5f;
-    c.maxSuspensionTravel = 0.4f;
-    c.frictionSlip = 5.0f;            // Realistic tire grip (was 1000!)
-    c.maxEngineForce = 2500.0f;
-    c.maxBrakingForce = 100.0f;
+    // Bullet3-correct suspension tuning: stiffness must be balanced with damping
+    // or the car accumulates energy and launches. These values are stable.
+    c.suspensionStiffness = 28.0f;
+    c.suspensionDamping = 4.4f;       // relaxation
+    c.suspensionCompression = 2.3f;
+    c.maxSuspensionTravel = 0.3f;
+    c.frictionSlip = 10.5f;           // Good grip without being grippy-glitchy
+    c.rollInfluence = 0.04f;          // Very low = stable, resists tipping
+    c.maxEngineForce = 1800.0f;       // Tame acceleration (was 2500 -> launched)
+    c.maxBrakingForce = 120.0f;
     c.maxSteerAngle = 0.5f;
+    c.maxSpeedMs = 50.0f;             // ~180 km/h limiter
+    c.modelScale = 1.15f;             // Car + wheels ~15% bigger (FPV feel)
+    c.wheelScale = 1.25f;             // Wheels 25% larger diameter (user request)
     return c;
 }
 
 VehicleConfig Vehicle::suvConfig() {
     VehicleConfig c;
     c.chassisHalfExtents = {1.1f, 0.6f, 2.5f};
+    c.chassisYShift = 0.2f;
     c.chassisMass = 2200.0f;
-    c.suspensionStiffness = 20.0f;
-    c.suspensionDamping = 5.0f;
-    c.suspensionCompression = 6.0f;
-    c.maxSuspensionTravel = 0.5f;
-    c.frictionSlip = 5.0f;
-    c.maxEngineForce = 3500.0f;
-    c.maxBrakingForce = 120.0f;
+    c.suspensionStiffness = 32.0f;
+    c.suspensionDamping = 5.5f;
+    c.suspensionCompression = 3.0f;
+    c.maxSuspensionTravel = 0.4f;
+    c.frictionSlip = 11.0f;
+    c.rollInfluence = 0.05f;
+    c.maxEngineForce = 2600.0f;
+    c.maxBrakingForce = 140.0f;
     c.maxSteerAngle = 0.45f;
+    c.maxSpeedMs = 50.0f;
+    c.modelScale = 1.2f;
+    c.wheelScale = 1.25f;
     return c;
 }
 
@@ -388,11 +480,20 @@ void Vehicle::computeWheelMeshCenters() {
         if (vertexCount > 0) {
             // Center of bounding box
             m_wheelMeshCenters[g] = (minBound + maxBound) * 0.5f;
-            LOG_INFO("  Wheel group %d center: (%.3f, %.3f, %.3f) [%d verts]",
+            // Measure the wheel radius from the Y/Z half-extents. The wheel is a
+            // disc in the Y-Z plane (axle along X), so the radius is the larger of
+            // the Y / Z half-extents. Keep the largest across all wheel groups --
+            // the tyre group dominates and gives the true outer radius.
+            float extY = 0.5f * (maxBound.y - minBound.y);
+            float extZ = 0.5f * (maxBound.z - minBound.z);
+            float groupRadius = std::max(extY, extZ);
+            if (groupRadius > m_modelWheelRadius) m_modelWheelRadius = groupRadius;
+            LOG_INFO("  Wheel group %d center: (%.3f, %.3f, %.3f) radius=%.3f [%d verts]",
                      g, m_wheelMeshCenters[g].x, m_wheelMeshCenters[g].y,
-                     m_wheelMeshCenters[g].z, vertexCount);
+                     m_wheelMeshCenters[g].z, groupRadius, vertexCount);
         }
     }
+    LOG_INFO("  Model wheel radius (max of groups): %.3f", m_modelWheelRadius);
 }
 
 } // namespace ps

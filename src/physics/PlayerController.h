@@ -54,9 +54,9 @@ private:
     btDefaultMotionState* m_motionState = nullptr;
 
     // Movement
-    float m_moveSpeed = 7.0f;
+    float m_moveSpeed = 5.5f;        // m/s walk speed (FPV feels right around 5-6)
     float m_jumpForce = 6.0f;
-    float m_sprintMult = 2.0f;
+    float m_sprintMult = 1.8f;       // Sprint multiplier (Shift)
     glm::vec3 m_pendingMove{0.0f};
 
     // State

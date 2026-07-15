@@ -67,9 +67,24 @@ void PlayerController::update(float dt) {
     // Apply horizontal movement as velocity (not force, for responsive control)
     btVector3 currentVel = m_body->getLinearVelocity();
 
-    // Convert pending move to world-space velocity
-    float targetVelX = m_pendingMove.x * m_moveSpeed;
-    float targetVelZ = m_pendingMove.z * m_moveSpeed;
+    // Convert pending move (a normalized world-space direction, optionally
+    // pre-scaled by a sprint factor) to a target horizontal velocity. We do NOT
+    // multiply by dt here -- setMoveInput receives a direction, and m_moveSpeed
+    // is the target speed in m/s. (The old code multiplied by dt twice, making
+    // movement framerate-dependent and far too slow.)
+    glm::vec3 horiz = m_pendingMove;
+    horiz.y = 0.0f;
+    float len = glm::length(horiz);
+    float targetSpeed = m_moveSpeed;
+    // Clamp the direction magnitude to 1 so diagonal movement isn't faster,
+    // but preserve a sprint scalar (>1) encoded by the caller.
+    if (len > 1.0f) {
+        targetSpeed *= len;   // sprint uses values > 1
+        horiz /= len;
+        len = 1.0f;
+    }
+    float targetVelX = horiz.x * targetSpeed;
+    float targetVelZ = horiz.z * targetSpeed;
 
     // Only apply horizontal movement; preserve vertical velocity (gravity/jump)
     btVector3 newVel(targetVelX, currentVel.y(), targetVelZ);

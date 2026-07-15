@@ -27,7 +27,9 @@ namespace Mask {
     constexpr short STATIC   = GROUP_PLAYER | GROUP_DYNAMIC | GROUP_VEHICLE | GROUP_WHEEL;
     constexpr short PLAYER   = GROUP_STATIC | GROUP_DYNAMIC | GROUP_VEHICLE | GROUP_INTERACT;
     constexpr short DYNAMIC  = GROUP_STATIC | GROUP_PLAYER | GROUP_DYNAMIC | GROUP_VEHICLE;
-    constexpr short VEHICLE  = GROUP_STATIC | GROUP_DYNAMIC | GROUP_WHEEL;
+    // NOTE: VEHICLE must include GROUP_PLAYER so the player capsule collides
+    // with (and cannot walk through) the car chassis.
+    constexpr short VEHICLE  = GROUP_STATIC | GROUP_DYNAMIC | GROUP_WHEEL | GROUP_PLAYER;
     constexpr short WHEEL    = GROUP_STATIC | GROUP_VEHICLE;
     constexpr short PROJECTILE = GROUP_STATIC | GROUP_DYNAMIC | GROUP_VEHICLE | GROUP_PLAYER;
     constexpr short RAYCAST  = GROUP_STATIC | GROUP_DYNAMIC | GROUP_VEHICLE | GROUP_INTERACT;
